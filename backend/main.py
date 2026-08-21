@@ -7,6 +7,7 @@ against. Ships in MOCK_MODE=true by default so they're never blocked
 waiting on your live API key.
 """
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 
 from config import CITIES
@@ -14,6 +15,17 @@ from fortyguard_service import get_environmental_data, get_heatmap
 from models import EnvironmentalData
 
 app = FastAPI(title="DC Cooling Copilot — Data API")
+
+# Allow the frontend (local dev + deployed) to call this API from the browser.
+# Without this, browsers block cross-origin requests by default (CORS policy) —
+# this is what Hardik's "blocked by CORS" error is about.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # hackathon setting: open to any origin, simplest fix.
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/api/health")
