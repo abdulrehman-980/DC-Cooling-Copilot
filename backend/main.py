@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 
 from config import CITIES
-from fortyguard_service import get_environmental_data, get_heatmap
+from fortyguard_service import get_environmental_data, get_heatmap, get_hourly_environmental_data
 from models import EnvironmentalData
 
 app = FastAPI(title="DC Cooling Copilot — Data API")
@@ -48,6 +48,19 @@ def environmental(city_key: str, date: str = None, time: str = None):
     time = time or datetime.now().strftime("%H:%M")
     try:
         return get_environmental_data(city_key, date, time)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/api/environmental/{city_key}/hourly")
+def environmental_hourly(city_key: str, date: str = None):
+    """
+    24 hourly readings for one day — for peak-risk-window detection.
+    date: YYYY-MM-DD (defaults to today)
+    """
+    date = date or datetime.now().strftime("%Y-%m-%d")
+    try:
+        return get_hourly_environmental_data(city_key, date)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 

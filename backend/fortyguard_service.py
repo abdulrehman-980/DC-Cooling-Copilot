@@ -70,20 +70,109 @@ def _fetch_live_env_params(city: dict, date: str, time_str: str) -> dict:
     Real call, following the handbook's submit -> poll pattern.
     The quickstart client handles polling internally when wait=True (default).
     Poll backoff (if you ever do this manually): 3s -> 6s -> 12s.
+
+    Field names confirmed from a live notebook run on 2026-08-20:
+    heat_index_celsius, wet_bulb_temperature_celsius, relative_humidity_percent,
+    and solar_irradiance nested under clear_sky.ghi.
+    `temperature` param is a required threshold value the endpoint uses
+    internally (e.g. for exceedance-style stats) — 35.0 is a reasonable
+    default, not something we display directly.
     """
     response = _client.environmental_parameters(
-        point={"lat": city["point"]["lat"], "lon": city["point"]["lon"]},
+        latitude=city["point"]["lat"],
+        longitude=city["point"]["lon"],
+        temperature=35.0,
         start_date=date,
         start_time=time_str,
+        filter_type=1,  # single hour
     )
-    data = response["result"]
+    result = response["result"]
+    location = result["locations"][0]
+    params = location["parameters"]
     return {
-        "temperature": data["temperature"],
-        "humidity": data["humidity"],
-        "heat_index": data["heat_index"],
-        "wet_bulb": data["wet_bulb_temperature"],
-        "solar_irradiance": data["solar_irradiance"],
+        "temperature": params.get("apparent_temperature_celsius", params.get("temperature_celsius")),
+        "humidity": params["relative_humidity_percent"],
+        "heat_index": params["heat_index_celsius"],
+        "wet_bulb": params["wet_bulb_temperature_celsius"],
+        "solar_irradiance": params.get("solar_irradiance", {}).get("clear_sky", {}).get("ghi", 0),
     }
+
+
+def _mock_hourly_series(city_key: str) -> list:
+    """
+    24 hourly mock readings with a realistic diurnal curve (peaks mid-
+    afternoon, lowest before dawn) — good enough for Adeel to build and
+    test peak-window detection against today, without live data.
+    """
+    import math
+    base = _mock_env_params(city_key)
+    hourly = []
+    for hour in range(24):
+        # peak around 15:00, trough around 05:00 — simple sine curve
+        swing = math.sin((hour - 9) / 24 * 2 * math.pi - math.pi / 2)
+        factor = 1 + 0.15 * swing
+        hourly.append({
+            "time": f"{hour:02d}:00",
+            "temperature": round(base["temperature"] * factor, 1),
+            "humidity": round(base["humidity"] * (2 - factor), 1),
+            "heat_index": round(base["heat_index"] * factor, 1),
+            "wet_bulb": round(base["wet_bulb"] * factor, 1),
+            "solar_irradiance": round(max(0, base["solar_irradiance"] * factor * (1 if 6 <= hour <= 19 else 0.05)), 1),
+        })
+    return hourly
+
+
+def get_hourly_environmental_data(city_key: str, date: str) -> dict:
+    """
+    Returns a full day (24 hourly readings) for peak-risk-window detection.
+    This is what Adeel needs for his risk engine — a single snapshot isn't
+    enough to find when risk peaks across a day.
+    """
+    if city_key not in CITIES:
+        raise ValueError(f"Unknown city: {city_key}")
+
+    city = CITIES[city_key]
+    cache_key = make_key(city_key, date, "hourly", "env_params_hourly")
+
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
+
+    if MOCK_MODE:
+        hourly = _mock_hourly_series(city_key)
+    else:
+        response = _client.environmental_parameters(
+            latitude=city["point"]["lat"],
+            longitude=city["point"]["lon"],
+            temperature=35.0,
+            start_date=date,
+            start_time="00:00",
+            end_time="23:00",
+            end_date=date,
+            filter_type=2,  # range of hours
+        )
+        result = response["result"]
+        location = result["locations"][0]
+        timestamps = result["metadata"]["timestamps"]
+        params = location["parameters"]
+        hourly = []
+        for i, ts in enumerate(timestamps):
+            hourly.append({
+                "time": ts,
+                "temperature": params.get("apparent_temperature_celsius", [None])[i],
+                "humidity": params.get("relative_humidity_percent", [None])[i],
+                "heat_index": params.get("heat_index_celsius", [None])[i],
+                "wet_bulb": params.get("wet_bulb_temperature_celsius", [None])[i],
+                "solar_irradiance": 0,  # solar not confirmed shaped as array yet — verify in notebook
+            })
+
+    output = {
+        "location": city["display_name"],
+        "date": date,
+        "hourly": hourly,
+    }
+    cache_set(cache_key, output)
+    return output
 
 
 def get_heatmap(city_key: str, date: str, time_str: str) -> dict:
