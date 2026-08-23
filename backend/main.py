@@ -8,7 +8,7 @@ waiting on your live API key.
 """
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from config import CITIES
 from fortyguard_service import get_environmental_data, get_heatmap, get_hourly_environmental_data
@@ -28,6 +28,16 @@ app.add_middleware(
 )
 
 
+def _safe_now():
+    """
+    A few hours in the past, not the exact current moment — FortyGuard's
+    data pipeline needs a short delay to compute the latest hour, and our
+    server's UTC clock doesn't match the demo cities' local time zones.
+    Requesting "right now" can come back empty; a small buffer avoids that.
+    """
+    return datetime.now() - timedelta(hours=4)
+
+
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
@@ -44,32 +54,39 @@ def environmental(city_key: str, date: str = None, time: str = None):
     date: YYYY-MM-DD (defaults to today)
     time: HH:MM (defaults to now)
     """
-    date = date or datetime.now().strftime("%Y-%m-%d")
-    time = time or datetime.now().strftime("%H:%M")
+    date = date or _safe_now().strftime("%Y-%m-%d")
+    time = time or _safe_now().strftime("%H:%M")
     try:
         return get_environmental_data(city_key, date, time)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"FortyGuard live data error: {e}")
 
 
 @app.get("/api/environmental/{city_key}/hourly")
 def environmental_hourly(city_key: str, date: str = None):
     """
     24 hourly readings for one day — for peak-risk-window detection.
-    date: YYYY-MM-DD (defaults to today)
+    date: YYYY-MM-DD (defaults to a recent day, not today, since today may
+    have hours the data pipeline hasn't computed yet)
     """
-    date = date or datetime.now().strftime("%Y-%m-%d")
+    date = date or (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")  # yesterday — full day guaranteed computed
     try:
         return get_hourly_environmental_data(city_key, date)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"FortyGuard live data error: {e}")
 
 
 @app.get("/api/heatmap/{city_key}")
 def heatmap(city_key: str, date: str = None, time: str = None):
-    date = date or datetime.now().strftime("%Y-%m-%d")
-    time = time or datetime.now().strftime("%H:%M")
+    date = date or _safe_now().strftime("%Y-%m-%d")
+    time = time or _safe_now().strftime("%H:%M")
     try:
         return get_heatmap(city_key, date, time)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"FortyGuard live data error: {e}")

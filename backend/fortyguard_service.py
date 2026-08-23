@@ -9,20 +9,53 @@ FORTYGUARD_MOCK_MODE=false).
 """
 import os
 import random
-import time as time_module
 
 from config import CITIES, DEFAULT_GRANULARITY
 from cache import get as cache_get, set as cache_set, make_key
 from models import EnvironmentalData
 
+
+class FortyGuardShapeError(Exception):
+    """Raised when the live API response doesn't match our expected shape —
+    carries diagnostic detail so we can fix field mapping without more
+    blind guessing."""
+
+
 MOCK_MODE = os.getenv("FORTYGUARD_MOCK_MODE", "true").lower() != "false"
 
-# Only import + construct the real client if we're not in mock mode,
-# so this file works even before the quickstart package is installed.
+# The real client is created lazily, on first actual use — NOT at import
+# time. Constructing it eagerly at import time means any problem (missing
+# API key, bad env var, etc.) crashes the ENTIRE app immediately, including
+# /api/health and /docs. Lazy + wrapped in try/except means a live-data
+# problem only affects the specific request that needed it.
 _client = None
-if not MOCK_MODE:
-    from fortyguard import FortyGuardClient  # from the quickstart repo
-    _client = FortyGuardClient()
+_client_error = None
+
+
+def _get_client():
+    global _client, _client_error
+    if _client is not None:
+        return _client
+    if _client_error is not None:
+        raise _client_error
+    try:
+        from fortyguard_client import FortyGuardClient  # flat file, not a subfolder
+        _client = FortyGuardClient()
+        return _client
+    except Exception as e:
+        _client_error = e
+        raise
+
+
+def _hour_of(time_value: str) -> int:
+    """
+    Extract the hour as an int from either format:
+    - mock / normalized: "00:00"
+    - raw live ISO timestamp: "2026-08-22T00:00:00-05:00"
+    """
+    if "T" in time_value:
+        time_value = time_value.split("T")[1]
+    return int(time_value.split(":")[0])
 
 
 def _mock_env_params(city_key: str) -> dict:
@@ -51,7 +84,11 @@ def get_environmental_data(city_key: str, date: str, time_str: str) -> Environme
     if MOCK_MODE:
         raw = _mock_env_params(city_key)
     else:
-        raw = _fetch_live_env_params(city, date, time_str)
+        # Reuses the hourly fetch (filter_type=2, full-day range) since that
+        # exact pattern is the one already confirmed to return real,
+        # non-empty data — then picks the hour closest to the requested time.
+        hourly_data = get_hourly_environmental_data(city_key, date)
+        raw = _closest_hour(hourly_data["hourly"], time_str)
 
     result = EnvironmentalData(
         location=city["display_name"],
@@ -65,37 +102,27 @@ def get_environmental_data(city_key: str, date: str, time_str: str) -> Environme
     return result
 
 
-def _fetch_live_env_params(city: dict, date: str, time_str: str) -> dict:
-    """
-    Real call, following the handbook's submit -> poll pattern.
-    The quickstart client handles polling internally when wait=True (default).
-    Poll backoff (if you ever do this manually): 3s -> 6s -> 12s.
+def _closest_hour(hourly: list, time_str: str) -> dict:
+    """Pick the hourly entry whose hour is closest to the requested time."""
+    if not hourly:
+        raise FortyGuardShapeError("Hourly data was empty — nothing to pick a snapshot from.")
+    try:
+        target_hour = _hour_of(time_str)
+    except (ValueError, IndexError):
+        target_hour = 12
+    best = min(hourly, key=lambda h: abs(_hour_of(h["time"]) - target_hour))
+    return best
 
-    Field names confirmed from a live notebook run on 2026-08-20:
-    heat_index_celsius, wet_bulb_temperature_celsius, relative_humidity_percent,
-    and solar_irradiance nested under clear_sky.ghi.
-    `temperature` param is a required threshold value the endpoint uses
-    internally (e.g. for exceedance-style stats) — 35.0 is a reasonable
-    default, not something we display directly.
+
+def _unwrap(value):
     """
-    response = _client.environmental_parameters(
-        latitude=city["point"]["lat"],
-        longitude=city["point"]["lon"],
-        temperature=35.0,
-        start_date=date,
-        start_time=time_str,
-        filter_type=1,  # single hour
-    )
-    result = response["result"]
-    location = result["locations"][0]
-    params = location["parameters"]
-    return {
-        "temperature": params.get("apparent_temperature_celsius", params.get("temperature_celsius")),
-        "humidity": params["relative_humidity_percent"],
-        "heat_index": params["heat_index_celsius"],
-        "wet_bulb": params["wet_bulb_temperature_celsius"],
-        "solar_irradiance": params.get("solar_irradiance", {}).get("clear_sky", {}).get("ghi", 0),
-    }
+    Live FortyGuard responses wrap each parameter in a list (time-series
+    style) even for a single-hour request. Take the first real value out
+    of that list; pass scalars through unchanged.
+    """
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
 
 
 def _mock_hourly_series(city_key: str) -> list:
@@ -141,7 +168,8 @@ def get_hourly_environmental_data(city_key: str, date: str) -> dict:
     if MOCK_MODE:
         hourly = _mock_hourly_series(city_key)
     else:
-        response = _client.environmental_parameters(
+        client = _get_client()
+        response = client.environmental_parameters(
             latitude=city["point"]["lat"],
             longitude=city["point"]["lon"],
             temperature=35.0,
@@ -155,14 +183,36 @@ def get_hourly_environmental_data(city_key: str, date: str) -> dict:
         location = result["locations"][0]
         timestamps = result["metadata"]["timestamps"]
         params = location["parameters"]
+
+        def _series(key):
+            val = params.get(key)
+            return val if isinstance(val, list) else []
+
+        temps = _series("apparent_temperature_celsius")
+        humids = _series("relative_humidity_percent")
+        heats = _series("heat_index_celsius")
+        wets = _series("wet_bulb_temperature_celsius")
+
+        if not any([temps, humids, heats, wets]):
+            raise FortyGuardShapeError(
+                f"Hourly live response had no data for any field. "
+                f"Raw parameters keys: {list(params.keys())}. "
+                f"Raw parameters (truncated): {str(params)[:800]}"
+            )
+
         hourly = []
         for i, ts in enumerate(timestamps):
+            # Normalize to "HH:MM" so the format matches mock mode exactly —
+            # teammates shouldn't see two different time formats depending
+            # on which mode the backend happens to be running in.
+            hour_part = ts.split("T")[1] if "T" in ts else ts
+            time_label = hour_part[:5]  # "HH:MM"
             hourly.append({
-                "time": ts,
-                "temperature": params.get("apparent_temperature_celsius", [None])[i],
-                "humidity": params.get("relative_humidity_percent", [None])[i],
-                "heat_index": params.get("heat_index_celsius", [None])[i],
-                "wet_bulb": params.get("wet_bulb_temperature_celsius", [None])[i],
+                "time": time_label,
+                "temperature": temps[i] if i < len(temps) else None,
+                "humidity": humids[i] if i < len(humids) else None,
+                "heat_index": heats[i] if i < len(heats) else None,
+                "wet_bulb": wets[i] if i < len(wets) else None,
                 "solar_irradiance": 0,  # solar not confirmed shaped as array yet — verify in notebook
             })
 
@@ -189,7 +239,8 @@ def get_heatmap(city_key: str, date: str, time_str: str) -> dict:
     if MOCK_MODE:
         result = {"city": city_key, "mock": True, "tiles": "mock-heatmap-payload"}
     else:
-        response = _client.create_heatmap(
+        client = _get_client()
+        response = client.create_heatmap(
             polygon_aoi=city["polygon_aoi"],
             start_date=date,
             start_time=time_str,
