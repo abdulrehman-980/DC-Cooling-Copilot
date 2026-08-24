@@ -6,7 +6,16 @@ whenever your credentials land.
 
 Once you have both, flip MOCK_MODE to False (or set env var
 FORTYGUARD_MOCK_MODE=false).
+
+STATIC DATA: on Vercel's free tier, live FortyGuard calls risk timing out
+(10s function limit vs FortyGuard's 15-20s+ processing time), and the
+file cache doesn't reliably persist between requests on serverless.
+Instead, run `refresh_data.py` locally to pre-fetch real data into
+backend/data/*.json — those are served instantly, no live call needed,
+zero timeout risk. Falls back to a live call only if no static file
+exists yet for that city.
 """
+import json
 import os
 import random
 
@@ -22,6 +31,17 @@ class FortyGuardShapeError(Exception):
 
 
 MOCK_MODE = os.getenv("FORTYGUARD_MOCK_MODE", "true").lower() != "false"
+STATIC_DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+
+
+def _load_static(city_key: str, kind: str):
+    """kind: 'snapshot' | 'hourly' | 'heatmap'. Returns None if not fetched yet."""
+    path = os.path.join(STATIC_DATA_DIR, f"{city_key}_{kind}.json")
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return None
+
 
 # The real client is created lazily, on first actual use — NOT at import
 # time. Constructing it eagerly at import time means any problem (missing
@@ -75,6 +95,13 @@ def get_environmental_data(city_key: str, date: str, time_str: str) -> Environme
         raise ValueError(f"Unknown city: {city_key}")
 
     city = CITIES[city_key]
+
+    # Static pre-fetched data (from refresh_data.py) — instant, no timeout risk.
+    if not MOCK_MODE:
+        static = _load_static(city_key, "snapshot")
+        if static:
+            return EnvironmentalData(**static)
+
     cache_key = make_key(city_key, date, time_str, "env_params")
 
     cached = cache_get(cache_key)
@@ -159,6 +186,13 @@ def get_hourly_environmental_data(city_key: str, date: str) -> dict:
         raise ValueError(f"Unknown city: {city_key}")
 
     city = CITIES[city_key]
+
+    # Static pre-fetched data (from refresh_data.py) — instant, no timeout risk.
+    if not MOCK_MODE:
+        static = _load_static(city_key, "hourly")
+        if static:
+            return static
+
     cache_key = make_key(city_key, date, "hourly", "env_params_hourly")
 
     cached = cache_get(cache_key)
@@ -225,11 +259,47 @@ def get_hourly_environmental_data(city_key: str, date: str) -> dict:
     return output
 
 
+def _mock_heatmap(city_key: str, city: dict) -> dict:
+    """
+    A small set of fake tiles matching the real FortyGuard heatmap shape
+    (map_data.features, each with a value + tile_id, plus stats_data) —
+    so the frontend can build the real structure now instead of a
+    throwaway flat shape that would need rebuilding later.
+    """
+    base = _mock_env_params(city_key)
+    features = []
+    lat, lon = city["point"]["lat"], city["point"]["lon"]
+    for i in range(9):  # small 3x3 mock grid
+        offset = (i % 3 - 1) * 0.01, (i // 3 - 1) * 0.01
+        features.append({
+            "type": "Feature",
+            "properties": {"tile_id": i, "value": round(base["temperature"] + random.uniform(-2, 2), 1)},
+            "geometry": {"type": "Point", "coordinates": [lon + offset[0], lat + offset[1]]},
+        })
+    values = [f["properties"]["value"] for f in features]
+    return {
+        "mock": True,
+        "map_data": {"type": "FeatureCollection", "features": features},
+        "stats_data": {
+            "analytic_type": "tcm", "units": "celsius", "n_cells": len(features),
+            "min": min(values), "max": max(values), "mean": round(sum(values) / len(values), 1),
+        },
+    }
+
+
 def get_heatmap(city_key: str, date: str, time_str: str) -> dict:
     if city_key not in CITIES:
         raise ValueError(f"Unknown city: {city_key}")
 
     city = CITIES[city_key]
+
+    # Static pre-fetched data (from refresh_data.py) — instant, no timeout risk.
+    # Heatmap is the slowest/largest endpoint — most likely to time out live.
+    if not MOCK_MODE:
+        static = _load_static(city_key, "heatmap")
+        if static:
+            return static
+
     cache_key = make_key(city_key, date, time_str, "heatmap")
 
     cached = cache_get(cache_key)
@@ -237,17 +307,49 @@ def get_heatmap(city_key: str, date: str, time_str: str) -> dict:
         return cached
 
     if MOCK_MODE:
-        result = {"city": city_key, "mock": True, "tiles": "mock-heatmap-payload"}
+        heatmap_data = _mock_heatmap(city_key, city)
     else:
         client = _get_client()
-        response = client.create_heatmap(
-            polygon_aoi=city["polygon_aoi"],
-            start_date=date,
-            start_time=time_str,
-            filter_type=1,
-            granularity=DEFAULT_GRANULARITY,
-        )
-        result = response["result"]
 
-    cache_set(cache_key, result)
-    return result
+        def _try(analytic_type, filter_type=1, **extra_kwargs):
+            kwargs = dict(
+                polygon_aoi=city["polygon_aoi"],
+                start_date=date,
+                granularity=DEFAULT_GRANULARITY,
+                analytic_type=analytic_type,
+                filter_type=filter_type,
+            )
+            if filter_type in (1, 2):
+                kwargs["start_time"] = time_str
+            kwargs.update(extra_kwargs)
+            response = client.create_heatmap(**kwargs)
+            data = response["result"]
+            has_tiles = bool(data.get("map_data", {}).get("features"))
+            return data, has_tiles
+
+        # Try the ideal case first: a true temperature snapshot at one hour.
+        heatmap_data, ok = _try("tcm", filter_type=1)
+        if not ok:
+            # Fall back to "exceedance" (hours past a threshold) — this is
+            # the combination already proven to return real, non-empty
+            # tile data earlier today. Crucially it needs filter_type=3
+            # (a whole day), since "hours past threshold" is meaningless
+            # within a single hour — that mismatch was the actual bug.
+            # Units differ (hours, not °C) — the response's stats_data.units
+            # field tells the frontend which one it actually got.
+            heatmap_data, ok = _try("exceedance", filter_type=3, threshold=35.0, direction="above")
+        if not ok:
+            raise FortyGuardShapeError(
+                f"Heatmap live response had no tile features, even with fallback. "
+                f"Raw response keys: {list(heatmap_data.keys())}. "
+                f"Raw response (truncated): {str(heatmap_data)[:800]}"
+            )
+
+    output = {
+        "location": city["display_name"],
+        "date": date,
+        "time": time_str,
+        "heatmap": heatmap_data,
+    }
+    cache_set(cache_key, output)
+    return output
